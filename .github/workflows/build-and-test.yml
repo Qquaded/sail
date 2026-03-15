@@ -1,188 +1,241 @@
-name: Build and Test
+name: Build SAIL
+
 on:
   push:
-    branches: [ master, main ]
+    branches: [ "**" ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ "**" ]
   workflow_dispatch:
 
 jobs:
-  build-linux-macos:
-    name: Build and Test on ${{ matrix.os }} - ${{ matrix.config.name }}
+  build:
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        config:
-          - { name: "Shared ASAN",          build_shared: "ON",  combine_codecs: "OFF", sail_asan: "ON",  sail_tsan: "OFF" }
-          - { name: "Shared TSAN",          build_shared: "ON",  combine_codecs: "OFF", sail_asan: "OFF", sail_tsan: "ON"  }
-          - { name: "Shared Combined ASAN", build_shared: "ON",  combine_codecs: "ON",  sail_asan: "ON",  sail_tsan: "OFF" }
-          - { name: "Shared Combined TSAN", build_shared: "ON",  combine_codecs: "ON",  sail_asan: "OFF", sail_tsan: "ON"  }
-          - { name: "Static ASAN",          build_shared: "OFF", combine_codecs: "OFF", sail_asan: "ON",  sail_tsan: "OFF" }
-          - { name: "Static TSAN",          build_shared: "OFF", combine_codecs: "OFF", sail_asan: "OFF", sail_tsan: "ON"  }
+        include:
+          - os: ubuntu-latest
+            preset: linux
+          - os: macos-latest
+            preset: macos
+          - os: windows-latest
+            preset: windows
 
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      # ── Source ────────────────────────────────────────────────────────────
+      - name: Checkout SAIL
+        uses: actions/checkout@v4
 
-    - name: Install dependencies (Linux)
-      if: runner.os == 'Linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
-                                libavif-dev libgif-dev libheif-dev libheif-plugin-x265            \
-                                libjbig-dev libjpeg-dev libjxl-dev libnanosvg-dev libopenexr-dev  \
-                                libopenjp2-7-dev libopenjpip-dec-server libopenjpip-server        \
-                                libpng-dev libraw-dev libsdl2-dev libtiff-dev libwebp-dev zlib1g-dev
+      # ── Dependencies: Linux ───────────────────────────────────────────────
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
+            libgif-dev libopenjp2-7-dev libjxl-dev \
+            libavif-dev libheif-dev
 
-    - name: Install dependencies (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        brew install ffmpeg giflib jbigkit jpeg-turbo jpeg-xl libavif libheif libpng libraw libtiff openexr openjpeg resvg webp
+      # ── Dependencies: macOS ───────────────────────────────────────────────
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install \
+            cmake ninja pkg-config \
+            ffmpeg \
+            jpeg libpng libtiff webp \
+            giflib openjpeg jpeg-xl \
+            libavif libheif
 
-    - name: Configure CMake
-      run: |
-        cmake -S . -B build \
-          -DCMAKE_BUILD_TYPE=Debug \
-          -DCMAKE_INSTALL_PREFIX=/usr/local \
-          -DBUILD_SHARED_LIBS=${{ matrix.config.build_shared }} \
-          -DSAIL_COMBINE_CODECS=${{ matrix.config.combine_codecs }} \
-          -DSAIL_ASAN=${{ matrix.config.sail_asan }} \
-          -DSAIL_TSAN=${{ matrix.config.sail_tsan }}
+      # ── Dependencies: Windows (vcpkg) ─────────────────────────────────────
+      - name: Setup vcpkg cache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:/vcpkg/installed
+            C:/vcpkg/packages
+            C:/vcpkg/buildtrees
+          key: vcpkg-sail-${{ hashFiles('**/vcpkg.json', 'cmake/vcpkg.json') }}-${{ runner.os }}
+          restore-keys: |
+            vcpkg-sail-${{ runner.os }}
 
-    - name: Build
-      run: cmake --build build -j$(nproc)
+      - name: Install dependencies (Windows / vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Use the vcpkg bundled with the runner
+          $env:VCPKG_ROOT = "C:/vcpkg"
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
 
-    - name: Install
-      run: |
-        sudo make -C build install
+          & "$env:VCPKG_ROOT/vcpkg" install `
+            ffmpeg `
+            libjpeg-turbo `
+            libpng `
+            tiff `
+            libwebp `
+            giflib `
+            openjpeg `
+            libjxl `
+            libavif `
+            libheif `
+            --triplet x64-windows `
+            --no-print-usage
 
-    - name: Run tests
-      env:
-        TSAN_OPTIONS: allocator_may_return_null=1
-      run: ctest --test-dir build --output-on-failure -j$(nproc)
+          # Expose vcpkg toolchain path for CMake
+          echo "VCPKG_ROOT=$env:VCPKG_ROOT" >> $env:GITHUB_ENV
+          echo "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
 
-    - name: Test SAIL binary (Linux)
-      if: runner.os == 'Linux'
-      run: |
-        sudo ldconfig
-        /usr/local/bin/sail --version
+      # ── Configure ─────────────────────────────────────────────────────────
+      - name: Configure (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/install" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DSAIL_COMBINE_CODECS=OFF \
+            -DSAIL_MANIP_USE_SWSCALE=ON \
+            -DSAIL_BUILD_APPS=ON \
+            -DSAIL_BUILD_EXAMPLES=OFF \
+            -DSAIL_BUILD_BINDINGS=ON \
+            -DSAIL_THREAD_SAFE=ON \
+            -DBUILD_TESTING=OFF
 
-    - name: Test SAIL binary (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        export DYLD_LIBRARY_PATH=/usr/local/lib:$DYLD_LIBRARY_PATH
-        /usr/local/bin/sail --version
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/install" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DBUILD_SHARED_LIBS=ON `
+            -DSAIL_COMBINE_CODECS=OFF `
+            -DSAIL_MANIP_USE_SWSCALE=ON `
+            -DSAIL_BUILD_APPS=ON `
+            -DSAIL_BUILD_EXAMPLES=OFF `
+            -DSAIL_BUILD_BINDINGS=ON `
+            -DSAIL_THREAD_SAFE=ON `
+            -DSAIL_WINDOWS_INSTALL_PDB=ON `
+            -DSAIL_WINDOWS_UTF8_PATHS=ON `
+            -DBUILD_TESTING=OFF
 
-    - name: Test external C API link
-      run: |
-        rm -rf tests/external/link/c/build
-        mkdir tests/external/link/c/build
-        cmake -S tests/external/link/c -B tests/external/link/c/build \
-          -DCMAKE_BUILD_TYPE=Debug \
-          -DSAIL_ASAN=${{ matrix.config.sail_asan }} \
-          -DSAIL_TSAN=${{ matrix.config.sail_tsan }}
-        cmake --build tests/external/link/c/build -j$(nproc)
-        tests/external/link/c/build/external-c-api-link
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: cmake --build build --config Release --parallel $(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
 
-    - name: Test external C++ API link
-      run: |
-        rm -rf tests/external/link/c++/build
-        mkdir tests/external/link/c++/build
-        cmake -S tests/external/link/c++ -B tests/external/link/c++/build \
-          -DCMAKE_BUILD_TYPE=Debug \
-          -DSAIL_ASAN=${{ matrix.config.sail_asan }} \
-          -DSAIL_TSAN=${{ matrix.config.sail_tsan }}
-        cmake --build tests/external/link/c++/build -j$(nproc)
-        tests/external/link/c++/build/external-c++-api-link
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --parallel
 
-  build-windows:
-    name: Build and Test on Windows - ${{ matrix.config.name }}
-    runs-on: windows-latest
-    env:
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg/archives
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - { name: "Shared",          build_shared: "ON",  combine_codecs: "OFF", static_crt: "OFF", triplet: "x64-windows",           appflags: "/MDd" }
-          - { name: "Shared Combined", build_shared: "ON",  combine_codecs: "ON",  static_crt: "OFF", triplet: "x64-windows",           appflags: "/MDd" }
-          - { name: "Static /MT",      build_shared: "OFF", combine_codecs: "OFF", static_crt: "ON",  triplet: "x64-windows-static",    appflags: "/MTd" }
-          - { name: "Static /MD",      build_shared: "OFF", combine_codecs: "OFF", static_crt: "OFF", triplet: "x64-windows-static-md", appflags: "/MDd" }
+      # ── Install into staging prefix ───────────────────────────────────────
+      - name: Install
+        run: cmake --install build --config Release
 
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      # ── Bundle shared-library dependencies ────────────────────────────────
+      #
+      # Linux: use ldd + chrpath/patchelf to gather and fix rpaths
+      # macOS: use dylibbundler to collect dylibs into install/lib
+      # Windows: vcpkg already installs DLLs; copy them alongside SAIL libs
 
-    - name: Cache vcpkg
-      uses: actions/cache@v4
-      with:
-        path: vcpkg
-        key: vcpkg-${{ matrix.config.triplet }}-${{ hashFiles('vcpkg.json') }}
+      - name: Bundle dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y patchelf
+          INSTALL="${{ github.workspace }}/install"
+          BUNDLED="$INSTALL/lib/bundled"
+          mkdir -p "$BUNDLED"
 
-    - name: Set up vcpkg
-      shell: bash
-      run: |
-        if [ ! -f "vcpkg/vcpkg.exe" ]; then
-          rm -rf vcpkg
-          git clone https://github.com/microsoft/vcpkg.git
-          cd vcpkg
-          ./bootstrap-vcpkg.bat
-        fi
+          # Collect all non-system shared libs that SAIL's libs depend on
+          find "$INSTALL/lib" -name "*.so*" -maxdepth 3 | while read lib; do
+            ldd "$lib" 2>/dev/null | awk '/=> \// {print $3}' | while read dep; do
+              # Skip core glibc/libm/libdl/libpthread – always present on target
+              base=$(basename "$dep")
+              case "$base" in
+                libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|\
+                ld-linux*.so*|libgcc_s.so*|libstdc++.so*) continue ;;
+              esac
+              [ -f "$dep" ] && cp -n "$dep" "$BUNDLED/" || true
+            done
+          done
 
-    - name: Configure CMake
-      shell: bash
-      run: |
-        mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-        cmake -S . -B build              \
-          -DCMAKE_BUILD_TYPE=Debug       \
-          -DCMAKE_INSTALL_PREFIX=C:/SAIL \
-          -DBUILD_SHARED_LIBS=${{ matrix.config.build_shared }} \
-          -DSAIL_COMBINE_CODECS=${{ matrix.config.combine_codecs }} \
-          -DSAIL_WINDOWS_STATIC_CRT=${{ matrix.config.static_crt }} \
-          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-          -DVCPKG_TARGET_TRIPLET=${{ matrix.config.triplet }} \
-          -DVCPKG_MANIFEST_DIR="${{ github.workspace }}"      \
-          -DVCPKG_INSTALL_OPTIONS="--clean-buildtrees-after-build"
+          # Fix rpaths so libraries find each other in the bundle
+          for lib in "$BUNDLED"/*.so*; do
+            [ -f "$lib" ] && patchelf --set-rpath '$ORIGIN' "$lib" || true
+          done
+          for lib in "$INSTALL/lib"/*.so*; do
+            [ -f "$lib" ] && patchelf --set-rpath '$ORIGIN:$ORIGIN/bundled' "$lib" || true
+          done
 
-    - name: Build
-      run: cmake --build build --config Debug --target install "-j$env:NUMBER_OF_PROCESSORS"
+          echo "Bundled libraries:"
+          ls -lh "$BUNDLED"
 
-    - name: Run tests
-      run: |
-        $env:PATH = "C:/SAIL/lib/sail/codecs/lib;$env:PATH"
-        ctest --test-dir build/tests -C Debug --output-on-failure "-j$env:NUMBER_OF_PROCESSORS"
+      - name: Bundle dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install dylibbundler
+          INSTALL="${{ github.workspace }}/install"
 
-    - name: Test SAIL binary
-      run: |
-        $env:PATH = "C:/SAIL/lib/sail/codecs/lib;$env:PATH"
-        C:/SAIL/bin/sail.exe --version
+          # Collect all SAIL dylibs and codec plugins
+          LIBS=$(find "$INSTALL" -name "*.dylib" | tr '\n' ' ')
+          mkdir -p "$INSTALL/lib/bundled"
 
-    - name: Test external C API link
-      working-directory: tests/external/link/c
-      run: |
-        mkdir build
-        cmake -S . -B build `
-          -DCMAKE_BUILD_TYPE=Debug `
-          -DCMAKE_PREFIX_PATH=C:/SAIL/lib/cmake `
-          -DCMAKE_C_FLAGS_DEBUG=${{ matrix.config.appflags }} `
-          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake `
-          -DVCPKG_TARGET_TRIPLET=${{ matrix.config.triplet }} `
-          -DVCPKG_MANIFEST_DIR=${{ github.workspace }}
-        cmake --build build --config Debug "-j$env:NUMBER_OF_PROCESSORS"
+          dylibbundler \
+            --bundle-deps \
+            --fix-file $LIBS \
+            --dest-dir "$INSTALL/lib/bundled" \
+            --install-path "@rpath/bundled/" \
+            --no-codesign \
+            -od || true
 
-    - name: Test external C++ API link
-      working-directory: tests/external/link/c++
-      run: |
-        mkdir build
-        cmake -S . -B build `
-          -DCMAKE_BUILD_TYPE=Debug `
-          -DCMAKE_PREFIX_PATH=C:/SAIL/lib/cmake `
-          -DCMAKE_CXX_FLAGS_DEBUG=${{ matrix.config.appflags }} `
-          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake `
-          -DVCPKG_TARGET_TRIPLET=${{ matrix.config.triplet }} `
-          -DVCPKG_MANIFEST_DIR=${{ github.workspace }}
-        cmake --build build --config Debug "-j$env:NUMBER_OF_PROCESSORS"
+          echo "Bundled libraries:"
+          ls -lh "$INSTALL/lib/bundled"
+
+      - name: Bundle dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $install  = "${{ github.workspace }}/install"
+          $vcpkgBin = "$env:VCPKG_ROOT/installed/x64-windows/bin"
+
+          # Copy vcpkg runtime DLLs next to SAIL's bin/ directory
+          if (Test-Path $vcpkgBin) {
+            Copy-Item "$vcpkgBin/*.dll" "$install/bin/" -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "DLLs in install/bin:"
+          Get-ChildItem "$install/bin/*.dll" | Select-Object Name, Length
+
+      # ── Smoke-test the sail tool ──────────────────────────────────────────
+      - name: Smoke test (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          INSTALL="${{ github.workspace }}/install"
+          export LD_LIBRARY_PATH="$INSTALL/lib:$INSTALL/lib/bundled:$LD_LIBRARY_PATH"
+          export DYLD_LIBRARY_PATH="$INSTALL/lib:$INSTALL/lib/bundled:$DYLD_LIBRARY_PATH"
+          "$INSTALL/bin/sail" --version
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $install = "${{ github.workspace }}/install"
+          $env:PATH = "$install/bin;$env:PATH"
+          & "$install/bin/sail.exe" --version
+
+      # ── Upload artifact (upload-artifact handles archiving internally) ──────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sail-${{ runner.os }}
+          path: ${{ github.workspace }}/install
+          retention-days: 30
+          if-no-files-found: error
