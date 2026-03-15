@@ -2,10 +2,12 @@ name: Build SAIL
 
 on:
   push:
-    branches: [ "**" ]
-  pull_request:
-    branches: [ "**" ]
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -17,11 +19,8 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            preset: linux
           - os: macos-latest
-            preset: macos
           - os: windows-latest
-            preset: windows
 
     steps:
       # ── Source ────────────────────────────────────────────────────────────
@@ -34,62 +33,69 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build pkg-config \
+            cmake ninja-build pkg-config patchelf \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
             libgif-dev libopenjp2-7-dev libjxl-dev \
-            libavif-dev libheif-dev
+            libavif-dev libheif-dev librsvg2-dev
 
       # ── Dependencies: macOS ───────────────────────────────────────────────
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew update
           brew install \
-            cmake ninja pkg-config \
             ffmpeg \
             jpeg libpng libtiff webp \
             giflib openjpeg jpeg-xl \
-            libavif libheif
+            libavif libheif librsvg \
+            dylibbundler
 
       # ── Dependencies: Windows (vcpkg) ─────────────────────────────────────
       - name: Setup vcpkg cache (Windows)
         if: runner.os == 'Windows'
         uses: actions/cache@v4
         with:
-          path: |
-            C:/vcpkg/installed
-            C:/vcpkg/packages
-            C:/vcpkg/buildtrees
-          key: vcpkg-sail-${{ hashFiles('**/vcpkg.json', 'cmake/vcpkg.json') }}-${{ runner.os }}
-          restore-keys: |
-            vcpkg-sail-${{ runner.os }}
+          path: C:/vcpkg/installed
+          key: vcpkg-sail-${{ runner.os }}-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: vcpkg-sail-${{ runner.os }}
 
       - name: Install dependencies (Windows / vcpkg)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Use the vcpkg bundled with the runner
           $env:VCPKG_ROOT = "C:/vcpkg"
           & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
-
           & "$env:VCPKG_ROOT/vcpkg" install `
-            ffmpeg `
-            libjpeg-turbo `
-            libpng `
-            tiff `
-            libwebp `
-            giflib `
-            openjpeg `
-            libjxl `
-            libavif `
-            libheif `
+            ffmpeg libjpeg-turbo libpng tiff libwebp giflib `
+            openjpeg libjxl libavif libheif librsvg `
             --triplet x64-windows `
+            --classic `
             --no-print-usage
-
-          # Expose vcpkg toolchain path for CMake
           echo "VCPKG_ROOT=$env:VCPKG_ROOT" >> $env:GITHUB_ENV
           echo "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
+
+      # ── NanoSVG (header-only, no system package on any platform) ─────────
+      - name: Install NanoSVG (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          git clone --depth 1 https://github.com/memononen/nanosvg.git /tmp/nanosvg
+          sudo mkdir -p /usr/local/include
+          sudo cp /tmp/nanosvg/src/nanosvg.h /tmp/nanosvg/src/nanosvgrast.h /usr/local/include/
+
+      - name: Install NanoSVG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          git clone --depth 1 https://github.com/memononen/nanosvg.git /tmp/nanosvg
+          cp /tmp/nanosvg/src/nanosvg.h /tmp/nanosvg/src/nanosvgrast.h /opt/homebrew/include/
+
+      - name: Install NanoSVG (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/memononen/nanosvg.git C:/nanosvg
+          $dest = "$env:VCPKG_ROOT/installed/x64-windows/include"
+          Copy-Item C:/nanosvg/src/nanosvg.h $dest
+          Copy-Item C:/nanosvg/src/nanosvgrast.h $dest
 
       # ── Configure ─────────────────────────────────────────────────────────
       - name: Configure (Linux / macOS)
@@ -97,13 +103,13 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/install" \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install \
             -DBUILD_SHARED_LIBS=ON \
-            -DSAIL_COMBINE_CODECS=OFF \
+            -DSAIL_COMBINE_CODECS=ON \
             -DSAIL_MANIP_USE_SWSCALE=ON \
-            -DSAIL_BUILD_APPS=ON \
+            -DSAIL_BUILD_APPS=OFF \
             -DSAIL_BUILD_EXAMPLES=OFF \
-            -DSAIL_BUILD_BINDINGS=ON \
+            -DSAIL_BUILD_BINDINGS=OFF \
             -DSAIL_THREAD_SAFE=ON \
             -DBUILD_TESTING=OFF
 
@@ -117,17 +123,17 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DBUILD_SHARED_LIBS=ON `
-            -DSAIL_COMBINE_CODECS=OFF `
+            -DSAIL_COMBINE_CODECS=ON `
             -DSAIL_MANIP_USE_SWSCALE=ON `
-            -DSAIL_BUILD_APPS=ON `
+            -DSAIL_BUILD_APPS=OFF `
             -DSAIL_BUILD_EXAMPLES=OFF `
-            -DSAIL_BUILD_BINDINGS=ON `
+            -DSAIL_BUILD_BINDINGS=OFF `
             -DSAIL_THREAD_SAFE=ON `
-            -DSAIL_WINDOWS_INSTALL_PDB=ON `
+            -DSAIL_WINDOWS_INSTALL_PDB=OFF `
             -DSAIL_WINDOWS_UTF8_PATHS=ON `
             -DBUILD_TESTING=OFF
 
-      # ── Build ─────────────────────────────────────────────────────────────
+      # ── Build & Install ───────────────────────────────────────────────────
       - name: Build (Linux / macOS)
         if: runner.os != 'Windows'
         run: cmake --build build --config Release --parallel $(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
@@ -136,123 +142,182 @@ jobs:
         if: runner.os == 'Windows'
         run: cmake --build build --config Release --parallel
 
-      # ── Install into staging prefix ───────────────────────────────────────
       - name: Install
         run: cmake --install build --config Release
 
-      # ── Bundle shared-library dependencies ────────────────────────────────
+      # ── Bundle only direct SAIL dependencies ──────────────────────────────
       #
-      # Linux: use ldd + chrpath/patchelf to gather and fix rpaths
-      # macOS: use dylibbundler to collect dylibs into install/lib
-      # Windows: vcpkg already installs DLLs; copy them alongside SAIL libs
+      # Strategy: collect the libs that SAIL's own .so/.dylib files link to
+      # directly (depth=1 only), skipping glibc/system libs. This keeps the
+      # bundle small — we don't recurse into transitive deps of deps.
 
       - name: Bundle dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y patchelf
           INSTALL="${{ github.workspace }}/install"
-          BUNDLED="$INSTALL/lib/bundled"
+          BUNDLED="$INSTALL/lib/sail/codecs/lib"
           mkdir -p "$BUNDLED"
 
-          # Collect all non-system shared libs that SAIL's libs depend on
-          find "$INSTALL/lib" -name "*.so*" -maxdepth 3 | while read lib; do
-            ldd "$lib" 2>/dev/null | awk '/=> \// {print $3}' | while read dep; do
-              # Skip core glibc/libm/libdl/libpthread – always present on target
-              base=$(basename "$dep")
-              case "$base" in
-                libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|\
-                ld-linux*.so*|libgcc_s.so*|libstdc++.so*) continue ;;
+          # Collect direct (depth-1) non-system deps of every SAIL lib + codec
+          find "$INSTALL/lib" -name "*.so*" -not -type d | while read lib; do
+            ldd "$lib" 2>/dev/null | awk '/=> \// { print $3 }' | while read dep; do
+              case "$(basename "$dep")" in
+                libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s.so*|\
+                libstdc++.so*|ld-linux*.so*|linux-vdso.so*) continue ;;
               esac
-              [ -f "$dep" ] && cp -n "$dep" "$BUNDLED/" || true
+              [ -f "$dep" ] && cp -Pn "$dep" "$BUNDLED/" 2>/dev/null || true
             done
           done
 
-          # Fix rpaths so libraries find each other in the bundle
-          for lib in "$BUNDLED"/*.so*; do
-            [ -f "$lib" ] && patchelf --set-rpath '$ORIGIN' "$lib" || true
+          # Fix rpaths: codecs find bundled libs in their own ../lib sibling dir
+          find "$INSTALL/lib" -name "*.so*" -not -type d | while read lib; do
+            patchelf --set-rpath '$ORIGIN:$ORIGIN/sail/codecs/lib' "$lib" 2>/dev/null || true
           done
-          for lib in "$INSTALL/lib"/*.so*; do
-            [ -f "$lib" ] && patchelf --set-rpath '$ORIGIN:$ORIGIN/bundled' "$lib" || true
+          find "$BUNDLED" -name "*.so*" -not -type d | while read lib; do
+            patchelf --set-rpath '$ORIGIN' "$lib" 2>/dev/null || true
           done
 
-          echo "Bundled libraries:"
-          ls -lh "$BUNDLED"
+          echo "=== Bundled ==="
+          du -sh "$BUNDLED"
+          ls "$BUNDLED" | wc -l
+          echo "=== Total install ==="
+          du -sh "$INSTALL"
 
       - name: Bundle dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install dylibbundler
           INSTALL="${{ github.workspace }}/install"
+          BUNDLED="$INSTALL/lib/sail/codecs/lib"
+          mkdir -p "$BUNDLED"
 
-          # Collect all SAIL dylibs and codec plugins
-          LIBS=$(find "$INSTALL" -name "*.dylib" | tr '\n' ' ')
-          mkdir -p "$INSTALL/lib/bundled"
+          # Collect direct deps of SAIL libs only (no recursion)
+          find "$INSTALL/lib" -name "*.dylib" | while read lib; do
+            otool -L "$lib" 2>/dev/null | awk 'NR>1 {print $1}' | while read dep; do
+              case "$dep" in
+                /usr/lib/*|/System/*|@rpath/*|@loader_path/*|@executable_path/*) continue ;;
+              esac
+              [ -f "$dep" ] && cp -n "$dep" "$BUNDLED/" 2>/dev/null || true
+            done
+          done
 
-          dylibbundler \
-            --bundle-deps \
-            --fix-file $LIBS \
-            --dest-dir "$INSTALL/lib/bundled" \
-            --install-path "@rpath/bundled/" \
-            --no-codesign \
-            -od || true
+          # Fix install names
+          find "$BUNDLED" -name "*.dylib" | while read lib; do
+            install_name_tool -id "@rpath/sail/codecs/lib/$(basename "$lib")" "$lib" 2>/dev/null || true
+          done
+          find "$INSTALL/lib" -name "*.dylib" | while read sail_lib; do
+            otool -L "$sail_lib" 2>/dev/null | awk 'NR>1 {print $1}' | while read dep; do
+              case "$dep" in
+                /usr/lib/*|/System/*|@rpath/*|@loader_path/*|@executable_path/*) continue ;;
+              esac
+              base=$(basename "$dep")
+              [ -f "$BUNDLED/$base" ] && \
+                install_name_tool -change "$dep" "@rpath/sail/codecs/lib/$base" "$sail_lib" 2>/dev/null || true
+            done
+            install_name_tool -add_rpath "@loader_path/sail/codecs/lib" "$sail_lib" 2>/dev/null || true
+          done
 
-          echo "Bundled libraries:"
-          ls -lh "$INSTALL/lib/bundled"
+          echo "=== Bundled ==="
+          du -sh "$BUNDLED"
+          echo "=== Total install ==="
+          du -sh "$INSTALL"
 
       - name: Bundle dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $install  = "${{ github.workspace }}/install"
-          $vcpkgBin = "$env:VCPKG_ROOT/installed/x64-windows/bin"
+          $bundled  = "$install/lib/sail/codecs/lib"
+          New-Item -ItemType Directory -Force -Path $bundled | Out-Null
 
-          # Copy vcpkg runtime DLLs next to SAIL's bin/ directory
-          if (Test-Path $vcpkgBin) {
-            Copy-Item "$vcpkgBin/*.dll" "$install/bin/" -Force -ErrorAction SilentlyContinue
+          # Copy only the vcpkg DLLs that are direct imports of SAIL's own DLLs.
+          # Use dumpbin to find direct imports, then match against vcpkg bin.
+          $vcpkgBin = "$env:VCPKG_ROOT/installed/x64-windows/bin"
+          $sailLibs = Get-ChildItem "$install/bin/*.dll","$install/lib/sail/codecs/*.dll" -ErrorAction SilentlyContinue
+
+          $needed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($dll in $sailLibs) {
+            $output = & dumpbin /dependents $dll.FullName 2>$null
+            foreach ($line in $output) {
+              if ($line -match '^\s+(\S+\.dll)\s*$') {
+                $null = $needed.Add($matches[1])
+              }
+            }
           }
 
-          Write-Host "DLLs in install/bin:"
-          Get-ChildItem "$install/bin/*.dll" | Select-Object Name, Length
+          foreach ($name in $needed) {
+            $src = Join-Path $vcpkgBin $name
+            if (Test-Path $src) {
+              Copy-Item $src $bundled -Force
+            }
+          }
 
-      # ── Smoke-test the sail tool ──────────────────────────────────────────
-      - name: Smoke test (Linux / macOS)
+          # Also copy the SAIL DLLs themselves into bin (standard Windows layout)
+          # The codec plugin DLLs stay in lib/sail/codecs/
+          Write-Host "=== Bundled DLLs ==="
+          Get-ChildItem $bundled | Measure-Object | Select-Object -ExpandProperty Count
+          Write-Host "=== Total size ==="
+          "{0:N1} MB" -f ((Get-ChildItem $install -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB)
+
+      # ── Strip debug symbols (Linux / macOS) to shrink further ─────────────
+      - name: Strip binaries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          find ${{ github.workspace }}/install -name "*.so*" -not -type d \
+            -exec strip --strip-unneeded {} \; 2>/dev/null || true
+
+      - name: Strip binaries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          find ${{ github.workspace }}/install -name "*.dylib" \
+            -exec strip -x {} \; 2>/dev/null || true
+
+      # ── Zip only headers + libs (no apps, no examples, no cmake files) ────
+      - name: Package (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
           INSTALL="${{ github.workspace }}/install"
-          export LD_LIBRARY_PATH="$INSTALL/lib:$INSTALL/lib/bundled:$LD_LIBRARY_PATH"
-          export DYLD_LIBRARY_PATH="$INSTALL/lib:$INSTALL/lib/bundled:$DYLD_LIBRARY_PATH"
-          "$INSTALL/bin/sail" --version
+          TAG="${{ github.ref_name }}"
+          OS="${{ runner.os }}"
+          ARCHIVE="sail-${TAG}-${OS}.zip"
 
-      - name: Smoke test (Windows)
+          cd "$INSTALL"
+          zip -r "${{ github.workspace }}/$ARCHIVE" \
+            include/ \
+            lib/ \
+            --exclude "*/cmake/*" \
+            --exclude "*/pkgconfig/*"
+
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          echo "=== Archive size ==="
+          du -sh "${{ github.workspace }}/$ARCHIVE"
+
+      - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $install = "${{ github.workspace }}/install"
-          $env:PATH = "$install/bin;$env:PATH"
-          & "$install/bin/sail.exe" --version
+          $tag     = "${{ github.ref_name }}"
+          $archive = "sail-$tag-Windows.zip"
 
-      # ── Archive artifact ──────────────────────────────────────────────────
-      - name: Create archive (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: |
-          cd "${{ github.workspace }}"
-          ARTIFACT="sail-${{ runner.os }}-${{ github.sha }}"
-          tar -czf "${ARTIFACT}.tar.gz" install/
-          echo "ARTIFACT_PATH=${ARTIFACT}.tar.gz" >> $GITHUB_ENV
+          # Include headers, lib (for import libs + codec plugins), and the
+          # runtime DLLs in bin/; exclude cmake integration files
+          $items = @(
+            "$install/include",
+            "$install/lib",
+            "$install/bin"
+          )
+          Compress-Archive -Path $items -DestinationPath "${{ github.workspace }}/$archive"
+          echo "ARCHIVE=$archive" >> $env:GITHUB_ENV
 
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $sha     = "${{ github.sha }}"
-          $archive = "sail-Windows-$sha.zip"
-          Compress-Archive -Path "${{ github.workspace }}/install/*" -DestinationPath "${{ github.workspace }}/$archive"
-          echo "ARTIFACT_PATH=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $size = (Get-Item "${{ github.workspace }}/$archive").Length / 1MB
+          Write-Host ("=== Archive size: {0:N1} MB ===" -f $size)
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      # ── Create / update GitHub Release and upload zip ─────────────────────
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: sail-${{ runner.os }}
-          path: ${{ env.ARTIFACT_PATH }}
-          retention-days: 30
-          if-no-files-found: error
+          tag_name: ${{ github.ref_name }}
+          name: SAIL ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: ${{ github.workspace }}/${{ env.ARCHIVE }}
