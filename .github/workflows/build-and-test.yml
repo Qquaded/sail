@@ -38,8 +38,10 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
             libgif-dev libopenjp2-7-dev libjxl-dev \
-            libavif-dev libheif-dev \
-            librsvg2-dev
+            libavif-dev libheif-dev
+          # nanosvg is header-only; clone and expose headers for SAIL SVG codec
+          sudo git clone --depth=1 https://github.com/memononen/nanosvg.git /opt/nanosvg
+          sudo cp /opt/nanosvg/src/nanosvg.h /opt/nanosvg/src/nanosvgrast.h /usr/local/include/
 
       # ── Dependencies: macOS ───────────────────────────────────────────────
       - name: Install dependencies (macOS)
@@ -51,8 +53,10 @@ jobs:
             ffmpeg \
             jpeg libpng libtiff webp \
             giflib openjpeg jpeg-xl \
-            libavif libheif \
-            librsvg
+            libavif libheif
+          # nanosvg is header-only; clone and expose headers for SAIL SVG codec
+          git clone --depth=1 https://github.com/memononen/nanosvg.git /tmp/nanosvg
+          sudo cp /tmp/nanosvg/src/nanosvg.h /tmp/nanosvg/src/nanosvgrast.h /usr/local/include/
 
       # ── Dependencies: Windows (vcpkg) ─────────────────────────────────────
       - name: Setup vcpkg cache (Windows)
@@ -86,14 +90,41 @@ jobs:
             libjxl `
             libavif `
             libheif `
-            librsvg `
             --triplet x64-windows `
             --classic `
             --no-print-usage
 
           # Expose vcpkg toolchain path for CMake
+          # nanosvg is header-only - clone and copy headers so SAIL SVG codec finds them
+          git clone --depth=1 https://github.com/memononen/nanosvg.git C:/nanosvg
+          Copy-Item "C:/nanosvg/src/nanosvg.h"     "C:/vcpkg/installed/x64-windows/include/" -Force
+          Copy-Item "C:/nanosvg/src/nanosvgrast.h"  "C:/vcpkg/installed/x64-windows/include/" -Force
+
           echo "VCPKG_ROOT=$env:VCPKG_ROOT" >> $env:GITHUB_ENV
           echo "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
+
+      # ── NanoSVG (header-only, no system package on any platform) ────────
+      - name: Build and install NanoSVG (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          git clone --depth 1 https://github.com/memononen/nanosvg.git /tmp/nanosvg
+          cmake -B /tmp/nanosvg-build -S /tmp/nanosvg -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/nanosvg-build
+          sudo cmake --install /tmp/nanosvg-build
+
+      - name: Build and install NanoSVG (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/memononen/nanosvg.git C:/nanosvg
+          cmake -B C:/nanosvg-build -S C:/nanosvg `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="C:/nanosvg-install"
+          cmake --build C:/nanosvg-build --config Release
+          cmake --install C:/nanosvg-build --config Release
+          echo "CMAKE_PREFIX_PATH=C:/nanosvg-install" >> $env:GITHUB_ENV
 
       # ── Configure ─────────────────────────────────────────────────────────
       - name: Configure (Linux / macOS)
@@ -129,6 +160,7 @@ jobs:
             -DSAIL_THREAD_SAFE=ON `
             -DSAIL_WINDOWS_INSTALL_PDB=ON `
             -DSAIL_WINDOWS_UTF8_PATHS=ON `
+            -DCMAKE_PREFIX_PATH="C:/nanosvg-install" `
             -DBUILD_TESTING=OFF
 
       # ── Build ─────────────────────────────────────────────────────────────
