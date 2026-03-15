@@ -38,7 +38,8 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
             libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
             libgif-dev libopenjp2-7-dev libjxl-dev \
-            libavif-dev libheif-dev
+            libavif-dev libheif-dev \
+            librsvg2-dev
 
       # ── Dependencies: macOS ───────────────────────────────────────────────
       - name: Install dependencies (macOS)
@@ -50,7 +51,8 @@ jobs:
             ffmpeg \
             jpeg libpng libtiff webp \
             giflib openjpeg jpeg-xl \
-            libavif libheif
+            libavif libheif \
+            librsvg
 
       # ── Dependencies: Windows (vcpkg) ─────────────────────────────────────
       - name: Setup vcpkg cache (Windows)
@@ -84,7 +86,9 @@ jobs:
             libjxl `
             libavif `
             libheif `
+            librsvg `
             --triplet x64-windows `
+            --classic `
             --no-print-usage
 
           # Expose vcpkg toolchain path for CMake
