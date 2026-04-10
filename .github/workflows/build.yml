@@ -74,7 +74,7 @@ jobs:
           echo "VCPKG_ROOT=$env:VCPKG_ROOT" >> $env:GITHUB_ENV
           echo "VCPKG_TARGET_TRIPLET=x64-windows" >> $env:GITHUB_ENV
 
-      # ── NanoSVG (header-only, no system package on any platform) ─────────
+      # ── NanoSVG ───────────────────────────────────────────────────────────
       - name: Install NanoSVG (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -145,12 +145,7 @@ jobs:
       - name: Install
         run: cmake --install build --config Release
 
-      # ── Bundle only direct SAIL dependencies ──────────────────────────────
-      #
-      # Strategy: collect the libs that SAIL's own .so/.dylib files link to
-      # directly (depth=1 only), skipping glibc/system libs. This keeps the
-      # bundle small — we don't recurse into transitive deps of deps.
-
+      # ── Bundle dependencies ───────────────────────────────────────────────
       - name: Bundle dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -158,18 +153,25 @@ jobs:
           BUNDLED="$INSTALL/lib/sail/codecs/lib"
           mkdir -p "$BUNDLED"
 
-          # Collect direct (depth-1) non-system deps of every SAIL lib + codec
-          find "$INSTALL/lib" -name "*.so*" -not -type d | while read lib; do
+          collect_deps() {
+            local lib="$1"
             ldd "$lib" 2>/dev/null | awk '/=> \// { print $3 }' | while read dep; do
               case "$(basename "$dep")" in
                 libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libgcc_s.so*|\
                 libstdc++.so*|ld-linux*.so*|linux-vdso.so*) continue ;;
               esac
-              [ -f "$dep" ] && cp -Pn "$dep" "$BUNDLED/" 2>/dev/null || true
+              base=$(basename "$dep")
+              if [ -f "$dep" ] && [ ! -f "$BUNDLED/$base" ]; then
+                cp -Pn "$dep" "$BUNDLED/"
+                collect_deps "$dep"
+              fi
             done
+          }
+
+          find "$INSTALL/lib" -name "*.so*" -not -type d | while read lib; do
+            collect_deps "$lib"
           done
 
-          # Fix rpaths: codecs find bundled libs in their own ../lib sibling dir
           find "$INSTALL/lib" -name "*.so*" -not -type d | while read lib; do
             patchelf --set-rpath '$ORIGIN:$ORIGIN/sail/codecs/lib' "$lib" 2>/dev/null || true
           done
@@ -177,11 +179,8 @@ jobs:
             patchelf --set-rpath '$ORIGIN' "$lib" 2>/dev/null || true
           done
 
-          echo "=== Bundled ==="
-          du -sh "$BUNDLED"
-          ls "$BUNDLED" | wc -l
-          echo "=== Total install ==="
-          du -sh "$INSTALL"
+          echo "=== Bundled ===" && du -sh "$BUNDLED"
+          echo "=== Total install ===" && du -sh "$INSTALL"
 
       - name: Bundle dependencies (macOS)
         if: runner.os == 'macOS'
@@ -190,20 +189,25 @@ jobs:
           BUNDLED="$INSTALL/lib/sail/codecs/lib"
           mkdir -p "$BUNDLED"
 
-          # Collect direct deps of SAIL libs only (no recursion)
-          find "$INSTALL/lib" -name "*.dylib" | while read lib; do
+          collect_deps() {
+            local lib="$1"
             otool -L "$lib" 2>/dev/null | awk 'NR>1 {print $1}' | while read dep; do
               case "$dep" in
                 /usr/lib/*|/System/*|@rpath/*|@loader_path/*|@executable_path/*) continue ;;
               esac
-              [ -f "$dep" ] && cp -n "$dep" "$BUNDLED/" 2>/dev/null || true
+              base=$(basename "$dep")
+              if [ -f "$dep" ] && [ ! -f "$BUNDLED/$base" ]; then
+                cp -n "$dep" "$BUNDLED/"
+                install_name_tool -id "@rpath/sail/codecs/lib/$base" "$BUNDLED/$base" 2>/dev/null || true
+                collect_deps "$dep"
+              fi
             done
+          }
+
+          find "$INSTALL/lib" -name "*.dylib" | while read lib; do
+            collect_deps "$lib"
           done
 
-          # Fix install names
-          find "$BUNDLED" -name "*.dylib" | while read lib; do
-            install_name_tool -id "@rpath/sail/codecs/lib/$(basename "$lib")" "$lib" 2>/dev/null || true
-          done
           find "$INSTALL/lib" -name "*.dylib" | while read sail_lib; do
             otool -L "$sail_lib" 2>/dev/null | awk 'NR>1 {print $1}' | while read dep; do
               case "$dep" in
@@ -216,10 +220,8 @@ jobs:
             install_name_tool -add_rpath "@loader_path/sail/codecs/lib" "$sail_lib" 2>/dev/null || true
           done
 
-          echo "=== Bundled ==="
-          du -sh "$BUNDLED"
-          echo "=== Total install ==="
-          du -sh "$INSTALL"
+          echo "=== Bundled ===" && du -sh "$BUNDLED"
+          echo "=== Total install ===" && du -sh "$INSTALL"
 
       - name: Bundle dependencies (Windows)
         if: runner.os == 'Windows'
@@ -229,36 +231,36 @@ jobs:
           $bundled  = "$install/lib/sail/codecs/lib"
           New-Item -ItemType Directory -Force -Path $bundled | Out-Null
 
-          # Copy only the vcpkg DLLs that are direct imports of SAIL's own DLLs.
-          # Use dumpbin to find direct imports, then match against vcpkg bin.
           $vcpkgBin = "$env:VCPKG_ROOT/installed/x64-windows/bin"
-          $sailLibs = Get-ChildItem "$install/bin/*.dll","$install/lib/sail/codecs/*.dll" -ErrorAction SilentlyContinue
 
-          $needed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-          foreach ($dll in $sailLibs) {
-            $output = & dumpbin /dependents $dll.FullName 2>$null
+          $queue   = [System.Collections.Generic.Queue[string]]::new()
+          $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+          Get-ChildItem "$install/bin/*.dll","$install/lib/sail/codecs/*.dll" `
+            -ErrorAction SilentlyContinue | ForEach-Object { $queue.Enqueue($_.FullName) }
+
+          while ($queue.Count -gt 0) {
+            $dll = $queue.Dequeue()
+            if (-not $visited.Add($dll)) { continue }
+
+            $output = & dumpbin /dependents $dll 2>$null
             foreach ($line in $output) {
               if ($line -match '^\s+(\S+\.dll)\s*$') {
-                $null = $needed.Add($matches[1])
+                $name = $matches[1]
+                $src  = Join-Path $vcpkgBin $name
+                $dest = Join-Path $bundled $name
+                if ((Test-Path $src) -and -not (Test-Path $dest)) {
+                  Copy-Item $src $dest -Force
+                  $queue.Enqueue($dest)
+                }
               }
             }
           }
 
-          foreach ($name in $needed) {
-            $src = Join-Path $vcpkgBin $name
-            if (Test-Path $src) {
-              Copy-Item $src $bundled -Force
-            }
-          }
+          $count = (Get-ChildItem $bundled | Measure-Object).Count
+          Write-Host "=== Bundled $count DLLs ==="
 
-          # Also copy the SAIL DLLs themselves into bin (standard Windows layout)
-          # The codec plugin DLLs stay in lib/sail/codecs/
-          Write-Host "=== Bundled DLLs ==="
-          Get-ChildItem $bundled | Measure-Object | Select-Object -ExpandProperty Count
-          Write-Host "=== Total size ==="
-          "{0:N1} MB" -f ((Get-ChildItem $install -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB)
-
-      # ── Strip debug symbols (Linux / macOS) to shrink further ─────────────
+      # ── Strip debug symbols ───────────────────────────────────────────────
       - name: Strip binaries (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -271,7 +273,7 @@ jobs:
           find ${{ github.workspace }}/install -name "*.dylib" \
             -exec strip -x {} \; 2>/dev/null || true
 
-      # ── Zip only headers + libs (no apps, no examples, no cmake files) ────
+      # ── Package ───────────────────────────────────────────────────────────
       - name: Package (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
@@ -288,8 +290,7 @@ jobs:
             --exclude "*/pkgconfig/*"
 
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
-          echo "=== Archive size ==="
-          du -sh "${{ github.workspace }}/$ARCHIVE"
+          echo "=== Archive size ===" && du -sh "${{ github.workspace }}/$ARCHIVE"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -299,8 +300,6 @@ jobs:
           $tag     = "${{ github.ref_name }}"
           $archive = "sail-$tag-Windows.zip"
 
-          # Include headers, lib (for import libs + codec plugins), and the
-          # runtime DLLs in bin/; exclude cmake integration files
           $items = @(
             "$install/include",
             "$install/lib",
@@ -312,7 +311,7 @@ jobs:
           $size = (Get-Item "${{ github.workspace }}/$archive").Length / 1MB
           Write-Host ("=== Archive size: {0:N1} MB ===" -f $size)
 
-      # ── Create / update GitHub Release and upload zip ─────────────────────
+      # ── Release ───────────────────────────────────────────────────────────
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
